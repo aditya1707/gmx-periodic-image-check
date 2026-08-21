@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Generated analysis outputs
+periodic_image_summary.csv
+periodic_image_min_distance.png
+mindist_pi.log
+
+# OS
+.DS_Store

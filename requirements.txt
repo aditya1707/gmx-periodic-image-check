@@ -1,0 +1,5 @@
+# Python dependencies for check_periodic_image.py.
+# GROMACS (for run_mindist_pi.sh) is a separate, external requirement.
+numpy
+pandas
+matplotlib   # optional: only needed for the diagnostic plot
