@@ -33,7 +33,16 @@ def write_xvg(path, min_periodic, ncol=6, box=6.0, max_internal=2.5):
 def test_read_runs_labels(tmp_path):
     f = tmp_path / "runs.txt"
     f.write_text("# comment\n/data/a   sysA\n/data/b\n\n")
-    assert cpi.read_runs(f) == [("/data/a", "sysA"), ("/data/b", "b")]
+    # Absent label -> None (so the plot can fall back to the path downstream).
+    assert cpi.read_runs(f) == [("/data/a", "sysA"), ("/data/b", None)]
+
+
+def test_analyse_group_defaults_to_dirname_when_label_absent(tmp_path):
+    p = tmp_path / "run" / "mindist_pi.xvg"
+    write_xvg(p, [1.0, 1.1], ncol=2)
+    rows, series = cpi.analyse([(str(p.parent), None)], 0.5, "mindist_pi.xvg")
+    assert rows[0]["group"] == "run"          # dir name for pooling
+    assert series[0][0] == str(p.parent)      # full path for the plot label
 
 
 def test_load_xvg_skips_headers(tmp_path):

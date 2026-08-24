@@ -49,7 +49,9 @@ def read_runs(path):
             continue
         parts = ln.split(None, 1)
         directory = parts[0]
-        label = parts[1].strip() if len(parts) > 1 else Path(directory).name
+        # None marks "no label given" so downstream can fall back appropriately
+        # (group -> directory name; plot label -> full path).
+        label = parts[1].strip() if len(parts) > 1 else None
         runs.append((directory, label))
     return runs
 
@@ -82,7 +84,7 @@ def generate(runs, args):
                     n_missing += 1
                     continue
                 cmd += ["-n", str(ndx)]
-            print(f"RUN     {d}  [group: {label}]")
+            print(f"RUN     {d}  [group: {label or d.name}]")
             log.write(f"\n==== {d} ====\n")
             log.flush()
             r = subprocess.run(cmd, input=args.group + "\n", text=True,
@@ -119,8 +121,12 @@ def analyse(runs, cutoff, outname):
             continue
 
         minper = data[:, 1]
+        # Group label for pooling defaults to the directory name; the plot uses
+        # the given label, falling back to the full path only when none was set.
+        group = label if label else Path(directory).name
+        plot_label = label if label else directory
         row = dict(
-            group=label,
+            group=group,
             run_dir=str(directory),
             n_frames=len(minper),
             closest_approach_nm=round(float(minper.min()), 3),   # the verdict
@@ -139,7 +145,7 @@ def analyse(runs, cutoff, outname):
             row["min_clearance_nm"] = round(float((box_min - maxint).min()), 3)
 
         rows.append(row)
-        series.append((f"{label}/{Path(directory).name}", minper))
+        series.append((plot_label, minper))
     return rows, series
 
 
@@ -187,7 +193,7 @@ def make_plot(series, cutoff, plot_file):
     ax.set_ylabel("min. distance to periodic image (nm)")
     ax.set_title("Minimum distance to periodic image")
     if 1 < len(series) <= 12:
-        ax.legend(fontsize=7)
+        ax.legend(fontsize=7, loc="upper right")
     fig.tight_layout()
     fig.savefig(plot_file, dpi=200)
     print(f"\nPlot written to {plot_file}")
