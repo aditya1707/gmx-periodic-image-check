@@ -17,11 +17,12 @@ Built on GROMACS `gmx mindist -pi`; see the
 
 - **GROMACS** on your `PATH` (only for `--run`; `gmx mindist -pi` is
   long-standing).
-- **Python 3.8+** with `numpy` and `pandas`; `matplotlib` only for `--plot`.
-  See [`requirements.txt`](requirements.txt). No install step — clone and run.
+- **Python 3.8+**. `numpy` and `pandas` are required; `matplotlib` is required
+  for `--plot`. Run the script in an environment where these are available;
+  `pip install -r requirements.txt` installs them if they are not.
 
 ```bash
-git clone <this-repo-url>
+git clone https://github.com/aditya1707/gmx-periodic-image-check.git
 cd gmx-periodic-image-check
 pip install -r requirements.txt
 ```
@@ -45,7 +46,7 @@ pip install -r requirements.txt
 2. Generate the data and summarise (needs GROMACS):
 
    ```bash
-   python check_periodic_image.py runs.txt --run --group Protein --cutoff 0.3
+   python check_periodic_image.py runs.txt --run --group Protein --cutoff 1.0
    ```
 
    Existing, non-empty outputs are skipped; add `--force` to regenerate.
@@ -53,7 +54,7 @@ pip install -r requirements.txt
 3. Re-summarise already-generated output (fast, no GROMACS), with the plot:
 
    ```bash
-   python check_periodic_image.py runs.txt --cutoff 0.3 --plot
+   python check_periodic_image.py runs.txt --cutoff 1.0 --plot
    ```
 
 Common flags: `--group` (default `Protein`), `--cutoff` nm (default `1.0`),
@@ -63,8 +64,9 @@ Common flags: `--group` (default `Protein`), `--cutoff` nm (default `1.0`),
 ## Interpreting the result
 
 The **verdict** comes from **column 2** of the `.xvg` (`min_periodic`) — the
-minimum distance between the group and any of its 26 periodic image copies,
-computed by GROMACS under full periodic boundary conditions:
+minimum distance between the group and any of its 26 periodic image copies
+(26 for `pbc = xyz`; 8 for `pbc = xy`), computed by GROMACS under full periodic
+boundary conditions:
 
 - **`closest_approach_nm`** — the closest the group ever came to its image. Above
   the cutoff means the images never interact.
