@@ -1,177 +1,172 @@
-"""Report whether a protein interacts with its own periodic image.
+#!/usr/bin/env python3
+"""Check whether a protein interacts with its own periodic image (GROMACS).
 
-Reads the ``mindist_pi.xvg`` files produced by ``run_mindist_pi.sh`` (via
-``gmx mindist -pi``) for every run listed in ``config.conf`` and reports two
-numbers per run and per group:
+Reads a runs file listing one run directory per line and, for each, uses
+``gmx mindist -pi`` output to report the closest the chosen group came to its
+periodic image (column 2 of the ``.xvg``) and the fraction of frames within an
+interaction cutoff. Column 2 is the verdict; the maximum internal distance and
+box vectors (columns 3-6) are reported alongside for information only -- a
+worst-case box-sizing view that, for proteins with large floppy side chains, is
+inflated by internal span rather than real image proximity.
 
-* closest approach -- the smallest distance the group ever came to its periodic
-  image (the minimum of column 2 of the ``.xvg``).
-* fraction within cutoff -- the fraction of frames in which that distance fell
-  below the interaction cutoff.
+With ``--run`` it first generates the mindist output by calling gmx; without it,
+it summarises existing output files.
 
-Both come from column 2 (``min_periodic``), the minimum distance between the
-group and any of its 26 periodic image copies. GROMACS computes this directly
-under full periodic boundary conditions, so it is the geometry-exact answer to
-"does the group touch its image?". The maximum-internal-distance-vs-box
-heuristic is deliberately not used: it is a worst-case box-sizing proxy that is
-inflated by large, floppy side chains and does not reflect actual image
-proximity.
+Runs file format -- one line per run::
 
-Outputs a CSV, a short printed summary, and a column-2 time-series diagnostic.
+    /path/to/run          optional_group_label
+
+The optional second word pools related runs (e.g. replicas) in the output; if
+omitted, the directory name is used. Blank lines and #-comments are ignored.
+
+Note: this is a geometric check on whichever group you select. For a group with
+no meaningful internal span (a lone ion or tiny ligand) gmx returns the box
+vector rather than a real image distance -- point ``--group`` at the protein.
 
 Usage:
-    python check_periodic_image.py [--config config.conf] [--cutoff 0.3]
-                                   [--csv periodic_image_summary.csv]
-                                   [--no-plot] [--plot-file FILE]
+    # generate data (needs gmx), then summarise:
+    python check_periodic_image.py runs.txt --run --group Protein --cutoff 0.3
+    # summarise existing mindist output, with the diagnostic plot:
+    python check_periodic_image.py runs.txt --cutoff 0.3 --plot
 """
 
 import argparse
-import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 
-# Fallback cutoff (nm) used only if the config has none and --cutoff is unset.
-DEFAULT_CUTOFF_NM = 1.0
-
-
-# --- Config parsing ----------------------------------------------------------
-def load_config(path):
-    """Parse the shell-style KEY="value" config, including a multi-line RUNS.
-
-    Returns a dict of string values. Handles values quoted on a single line,
-    an unquoted single-line value, and a double-quoted value that spans several
-    lines (as RUNS does).
-    """
-    cfg = {}
-    lines = Path(path).read_text().splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        i += 1
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, val = line.split("=", 1)
-        key = key.strip()
-        val = val.strip()
-        if val.startswith('"'):
-            close = val.find('"', 1)
-            if close != -1:
-                # Quote closes on the same line; anything after it is a comment.
-                cfg[key] = val[1:close]
-            else:
-                # Open quote with no close: the value continues on later lines.
-                buf = [val[1:]]
-                while i < len(lines):
-                    nxt = lines[i]
-                    i += 1
-                    if nxt.rstrip().endswith('"'):
-                        buf.append(nxt.rstrip()[:-1])
-                        break
-                    buf.append(nxt)
-                cfg[key] = "\n".join(buf)
-        else:
-            # Unquoted value: drop any trailing inline comment.
-            if "#" in val:
-                val = val.split("#", 1)[0].strip()
-            cfg[key] = val.strip("'")
-    return cfg
-
-
-def build_runs(cfg):
-    """Return a list of (directory, group_label) pairs from the config.
-
-    Mirrors run_mindist_pi.sh: the explicit RUNS list wins; otherwise the
-    BASE/<replica>/<system> grid is expanded.
-    """
+def read_runs(path):
+    """Parse the runs file into a list of (directory, group_label) pairs."""
     runs = []
-    runs_raw = cfg.get("RUNS", "").strip()
-    if runs_raw:
-        for ln in runs_raw.splitlines():
-            ln = ln.strip()
-            if not ln or ln.startswith("#"):
-                continue
-            parts = ln.split(None, 1)
-            directory = parts[0]
-            group = parts[1].strip() if len(parts) > 1 else os.path.basename(
-                directory.rstrip("/"))
-            runs.append((directory, group))
-    else:
-        base = cfg.get("BASE", "").strip()
-        reps = cfg.get("REPLICAS", "").split()
-        syss = cfg.get("SYSTEMS", "").split()
-        if base and reps and syss:
-            for rep in reps:
-                for sys in syss:
-                    runs.append((os.path.join(base, rep, sys), sys))
+    for ln in Path(path).read_text().splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        parts = ln.split(None, 1)
+        directory = parts[0]
+        label = parts[1].strip() if len(parts) > 1 else Path(directory).name
+        runs.append((directory, label))
     return runs
 
 
-# --- Data loading ------------------------------------------------------------
-def load_min_periodic(path):
-    """Read column 2 (min_periodic, nm) from a gmx mindist -pi .xvg.
+def generate(runs, args):
+    """Run gmx mindist -pi per run, skipping existing non-empty outputs."""
+    if shutil.which("gmx") is None:
+        sys.exit("ERROR: 'gmx' not found on PATH. Load your GROMACS module first.")
 
-    Comment/legend lines (@, #, &) and unparseable lines are skipped. Only the
-    first two columns (time, min_periodic) are needed.
-    """
-    vals = []
-    with open(path) as f:
-        for line in f:
-            if not line.strip() or line[0] in "@#&":
+    n_run = n_skip = n_missing = n_fail = 0
+    with open("mindist_pi.log", "a") as log:
+        for directory, label in runs:
+            d = Path(directory)
+            out = d / args.outname
+            if out.exists() and out.stat().st_size > 0 and not args.force:
+                print(f"SKIP    {d} (output exists; --force to redo)")
+                n_skip += 1
                 continue
-            parts = line.split()
-            if len(parts) < 2:
+            xtc, tpr = d / args.xtc, d / args.tpr
+            if not d.is_dir() or not xtc.is_file() or not tpr.is_file():
+                print(f"MISSING {d} (need {args.xtc} and {args.tpr})")
+                n_missing += 1
                 continue
-            try:
-                vals.append(float(parts[1]))
-            except ValueError:
-                continue
-    return np.asarray(vals, dtype=float)
+            cmd = ["gmx", "mindist", "-f", str(xtc), "-s", str(tpr),
+                   "-pi", "-od", str(out)]
+            if args.ndx:
+                ndx = d / args.ndx
+                if not ndx.is_file():
+                    print(f"MISSING {d} (ndx '{args.ndx}' absent)")
+                    n_missing += 1
+                    continue
+                cmd += ["-n", str(ndx)]
+            print(f"RUN     {d}  [group: {label}]")
+            log.write(f"\n==== {d} ====\n")
+            log.flush()
+            r = subprocess.run(cmd, input=args.group + "\n", text=True,
+                               stdout=log, stderr=subprocess.STDOUT)
+            if r.returncode == 0:
+                n_run += 1
+            else:
+                print(f"FAIL    {d} (see mindist_pi.log)")
+                n_fail += 1
+    print(f"\nGenerated: ran={n_run} skipped={n_skip} "
+          f"missing={n_missing} failed={n_fail}")
 
 
-# --- Per-run analysis --------------------------------------------------------
-def analyse_run(directory, group, outname, cutoff):
-    """Compute the periodic-image statistics for one run directory.
-
-    Returns (row_dict, min_periodic_series) or None if the file is missing/empty.
-    """
-    path = Path(directory) / outname
-    if not path.exists():
-        print(f"  missing: {path}")
-        return None
-    minper = load_min_periodic(path)
-    if minper.size == 0:
-        print(f"  unreadable (no data): {path}")
-        return None
-
-    row = dict(
-        group=group,
-        run_dir=str(directory),
-        n_frames=len(minper),
-        closest_approach_nm=round(float(minper.min()), 3),
-        frac_within_cutoff=round(float(np.mean(minper < cutoff)), 4),
-    )
-    return row, minper
+def load_xvg(path):
+    """Load a gmx mindist -pi .xvg as a 2-D array, skipping @/#/& lines."""
+    return np.atleast_2d(np.loadtxt(path, comments=["@", "#", "&"]))
 
 
-# --- Reporting ---------------------------------------------------------------
-def print_report(df, cutoff):
-    """Print a per-run table and a per-group closest-approach / fraction summary."""
-    pd.set_option("display.width", 160)
+def analyse(runs, cutoff, outname):
+    """Compute per-run statistics. Returns (rows, plot_series)."""
+    rows, series = [], []
+    for directory, label in runs:
+        path = Path(directory) / outname
+        if not path.exists():
+            print(f"  missing: {path}")
+            continue
+        try:
+            data = load_xvg(path)
+        except Exception:
+            print(f"  unreadable: {path}")
+            continue
+        if data.size == 0 or data.shape[1] < 2:
+            print(f"  unreadable (need >=2 columns): {path}")
+            continue
+
+        minper = data[:, 1]
+        row = dict(
+            group=label,
+            run_dir=str(directory),
+            n_frames=len(minper),
+            closest_approach_nm=round(float(minper.min()), 3),   # the verdict
+            frac_within_cutoff=round(float(np.mean(minper < cutoff)), 4),
+            max_internal_nm=np.nan,     # informational (columns 3-6 below)
+            min_box_nm=np.nan,
+            min_clearance_nm=np.nan,
+        )
+        if data.shape[1] >= 6:
+            maxint = data[:, 2]
+            box_min = data[:, 3:6].min(axis=1)          # tightest edge per frame
+            row["max_internal_nm"] = round(float(maxint.max()), 3)
+            row["min_box_nm"] = round(float(box_min.min()), 3)
+            # Worst-case clearance between the group's span and a box edge; can
+            # go negative when a floppy span exceeds an edge (why column 2 leads).
+            row["min_clearance_nm"] = round(float((box_min - maxint).min()), 3)
+
+        rows.append(row)
+        series.append((f"{label}/{Path(directory).name}", minper))
+    return rows, series
+
+
+def report(df, cutoff):
+    """Print the per-run table and a per-group verdict + informational block."""
+    pd.set_option("display.width", 170)
     pd.set_option("display.max_columns", None)
 
-    print("\n=== Per-run periodic-image summary ===")
+    print("\n=== Per-run summary ===")
     print(df.to_string(index=False))
 
     print(f"\n=== Per-group summary (cutoff = {cutoff:g} nm) ===")
     for grp, g in df.groupby("group"):
         closest = g["closest_approach_nm"].min()          # nearest over runs
-        mean_frac = g["frac_within_cutoff"].mean()
-        print(f"\n{grp}  ({len(g)} run(s))")
-        print(f"  closest image approach : {closest:.3f} nm")
-        print(f"  % of frames within {cutoff:g} nm   : {mean_frac * 100:.2f} %")
+        # Pool the fraction across runs by frame count, not a plain mean of
+        # per-run fractions (runs may differ in length).
+        pooled = np.average(g["frac_within_cutoff"], weights=g["n_frames"])
+        print(f"\n{grp}  ({len(g)} run(s), {int(g['n_frames'].sum())} frames)")
+        print("  verdict -- column 2, actual distance to periodic image:")
+        print(f"    closest image approach    : {closest:.3f} nm")
+        print(f"    % of frames within {cutoff:g} nm : {pooled * 100:.2f} %")
+        if g["max_internal_nm"].notna().any():
+            print("  informational -- max internal distance vs box "
+                  "(not the verdict):")
+            print(f"    max internal distance     : {g['max_internal_nm'].max():.3f} nm")
+            print(f"    tightest box edge         : {g['min_box_nm'].min():.3f} nm")
+            print(f"    min box-edge clearance    : {g['min_clearance_nm'].min():.3f} nm")
 
 
 def make_plot(series, cutoff, plot_file):
@@ -191,7 +186,6 @@ def make_plot(series, cutoff, plot_file):
     ax.set_xlabel("frame")
     ax.set_ylabel("min. distance to periodic image (nm)")
     ax.set_title("Minimum distance to periodic image")
-    # A legend helps for a few overlaid runs; skip it when it would be a wall.
     if 1 < len(series) <= 12:
         ax.legend(fontsize=7)
     fig.tight_layout()
@@ -199,58 +193,53 @@ def make_plot(series, cutoff, plot_file):
     print(f"\nPlot written to {plot_file}")
 
 
-# --- Entry point -------------------------------------------------------------
 def main():
-    script_dir = Path(__file__).resolve().parent
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", default=str(script_dir / "config.conf"),
-                        help="path to the shared config file")
-    parser.add_argument("--cutoff", type=float, default=None,
-                        help="interaction cutoff in nm (overrides the config)")
-    parser.add_argument("--csv", default="periodic_image_summary.csv",
-                        help="output CSV path")
-    parser.add_argument("--no-plot", action="store_true", help="skip the plot")
-    parser.add_argument("--plot-file", default="periodic_image_min_distance.png",
-                        help="output plot path")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("runs_file", help="text file listing run directories")
+    p.add_argument("--run", action="store_true",
+                   help="generate mindist output with gmx before summarising")
+    p.add_argument("--force", action="store_true",
+                   help="with --run, regenerate even where output exists")
+    p.add_argument("--group", default="Protein", help="gmx group to check")
+    p.add_argument("--cutoff", type=float, default=1.0,
+                   help="interaction cutoff in nm (default 1.0)")
+    p.add_argument("--xtc", default="prd.xtc", help="trajectory file name")
+    p.add_argument("--tpr", default="prd.tpr", help="run input (.tpr) file name")
+    p.add_argument("--ndx", default="", help="index file name (optional)")
+    p.add_argument("--outname", default="mindist_pi.xvg",
+                   help="mindist output file name, written in each run dir")
+    p.add_argument("--csv", default="periodic_image_summary.csv",
+                   help="output CSV path")
+    p.add_argument("--plot", action="store_true",
+                   help="write the diagnostic time-series plot")
+    p.add_argument("--plot-file", default="periodic_image_min_distance.png",
+                   help="plot output path")
+    args = p.parse_args()
 
-    if not Path(args.config).exists():
-        parser.error(f"config file not found: {args.config}")
-    cfg = load_config(args.config)
+    if args.run and not args.tpr.endswith(".tpr"):
+        sys.exit(f"ERROR: --tpr '{args.tpr}' is not a .tpr run input file; "
+                 f"gmx mindist -pi needs a .tpr.")
 
-    # Cutoff precedence: --cutoff > config > built-in default.
-    if args.cutoff is not None:
-        cutoff = args.cutoff
-    elif cfg.get("CUTOFF_NM", "").strip():
-        cutoff = float(cfg["CUTOFF_NM"])
-    else:
-        cutoff = DEFAULT_CUTOFF_NM
-
-    outname = cfg.get("OUTNAME", "").strip() or "mindist_pi.xvg"
-    runs = build_runs(cfg)
+    runs = read_runs(args.runs_file)
     if not runs:
-        parser.error("no runs defined in the config (fill in RUNS or the grid).")
+        sys.exit(f"No runs found in {args.runs_file}.")
 
-    rows, series = [], []
-    for directory, group in runs:
-        result = analyse_run(directory, group, outname, cutoff)
-        if result is not None:
-            row, minper = result
-            rows.append(row)
-            series.append((f"{group}/{Path(directory).name}", minper))
+    if args.run:
+        generate(runs, args)
 
+    rows, series = analyse(runs, args.cutoff, args.outname)
     if not rows:
-        print("\nNo readable output files found. Run run_mindist_pi.sh first.")
+        print("\nNo readable output files. Use --run to generate them first.")
         return
 
     df = pd.DataFrame(rows)
     df.to_csv(args.csv, index=False)
-    print_report(df, cutoff)
+    report(df, args.cutoff)
     print(f"\nCSV written to {args.csv}")
 
-    if not args.no_plot:
-        make_plot(series, cutoff, args.plot_file)
+    if args.plot:
+        make_plot(series, args.cutoff, args.plot_file)
 
 
 if __name__ == "__main__":

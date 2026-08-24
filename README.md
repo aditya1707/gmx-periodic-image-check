@@ -1,92 +1,91 @@
 # gmx-periodic-image-check
 
 Check whether a protein — or any chosen group — interacts with its own periodic
-image during a GROMACS MD simulation. This is a standard sanity check for a box
-that may be too small.
+image during a GROMACS MD simulation. A standard sanity check for a box that may
+be too small.
 
-Two steps, driven by a single config file:
-
-1. **`run_mindist_pi.sh`** runs `gmx mindist -pi` on every run you list and
-   writes a `mindist_pi.xvg` into each run directory.
-2. **`check_periodic_image.py`** reads those files and reports, per run and per
-   group, the closest the group ever came to its image and the fraction of
-   frames within an interaction cutoff. It writes a CSV, prints a summary, and
-   draws a diagnostic time-series plot.
-
-Both read the same **`config.conf`** — the only file you edit.
+One script, `check_periodic_image.py`. It runs `gmx mindist -pi` over a list of
+run directories (with `--run`) and reports, per run and per group, the closest
+the group ever came to its image and the fraction of frames within an
+interaction cutoff. All settings are command-line flags; the only file you write
+is a `runs.txt` listing your directories.
 
 Built on GROMACS `gmx mindist -pi`; see the
 [`gmx mindist` reference](https://manual.gromacs.org/current/onlinehelp/gmx-mindist.html).
 
 ## Requirements
 
-- **GROMACS** on your `PATH` (any reasonably recent version; `gmx mindist -pi`
-  is long-standing). Needed only for step 1.
-- **Python 3.8+** with `numpy` and `pandas`; `matplotlib` is optional (only for
-  the plot). See [`requirements.txt`](requirements.txt).
-
-No installation step — clone the repo and run the two scripts.
+- **GROMACS** on your `PATH` (only for `--run`; `gmx mindist -pi` is
+  long-standing).
+- **Python 3.8+** with `numpy` and `pandas`; `matplotlib` only for `--plot`.
+  See [`requirements.txt`](requirements.txt). No install step — clone and run.
 
 ```bash
 git clone <this-repo-url>
 cd gmx-periodic-image-check
-pip install -r requirements.txt      # numpy, pandas, matplotlib
+pip install -r requirements.txt
 ```
 
 ## Use
 
-1. Edit `config.conf`: list your run directories under `RUNS`, set the
-   trajectory and topology file names, the `GROUP` to check, and the
-   `CUTOFF_NM`.
-2. Generate the data (needs GROMACS):
+1. Write a `runs.txt` — one run directory per line, with an optional group label
+   (see [`example_runs.txt`](example_runs.txt)):
 
-   ```bash
-   ./run_mindist_pi.sh
+   ```
+   /data/native/1      native
+   /data/native/2      native
+   /data/mutant/1      mutant
+   /data/one_off_run
    ```
 
-   Existing, non-empty outputs are skipped; `FORCE=1 ./run_mindist_pi.sh` redoes
-   them all. Use a different config with `./run_mindist_pi.sh myconfig.conf`.
-3. Summarise:
+   The optional second word pools related runs (e.g. replicas) in the output; if
+   omitted, the directory name is used. Any layout works — one simulation, many,
+   with or without replicas.
+
+2. Generate the data and summarise (needs GROMACS):
 
    ```bash
-   python check_periodic_image.py
+   python check_periodic_image.py runs.txt --run --group Protein --cutoff 0.3
    ```
 
-   Override the cutoff without editing the config with `--cutoff 1.2`; skip the
-   figure with `--no-plot`; point at another config with `--config myconfig.conf`.
-   The CSV and plot are written to the directory you run from.
+   Existing, non-empty outputs are skipped; add `--force` to regenerate.
 
-## Layouts
+3. Re-summarise already-generated output (fast, no GROMACS), with the plot:
 
-`RUNS` takes one directory per line, so any layout works — a single simulation,
-several simulations, or replicas. An optional second word on a line is a group
-label that pools related runs (e.g. replicas) in the output. If your data is
-laid out as `BASE/<replica>/<system>`, you can instead fill in the
-`BASE`/`REPLICAS`/`SYSTEMS` grid shortcut and leave `RUNS` empty.
+   ```bash
+   python check_periodic_image.py runs.txt --cutoff 0.3 --plot
+   ```
+
+Common flags: `--group` (default `Protein`), `--cutoff` nm (default `1.0`),
+`--xtc`/`--tpr`/`--ndx`/`--outname` file names, `--csv`, `--plot`,
+`--plot-file`. The CSV and plot are written to the directory you run from.
 
 ## Interpreting the result
 
-Both numbers come from **column 2** of the `.xvg` (`min_periodic`) — the minimum
-distance between the group and any of its 26 periodic image copies, computed by
-GROMACS under full periodic boundary conditions.
+The **verdict** comes from **column 2** of the `.xvg` (`min_periodic`) — the
+minimum distance between the group and any of its 26 periodic image copies,
+computed by GROMACS under full periodic boundary conditions:
 
-- **`closest_approach_nm`** — the closest the group ever came to its image. If
-  this stays above your cutoff, the images never interact.
-- **`frac_within_cutoff`** — fraction of frames in which that distance fell
-  below the cutoff. `0` is the clean result.
+- **`closest_approach_nm`** — the closest the group ever came to its image. Above
+  the cutoff means the images never interact.
+- **`frac_within_cutoff`** — fraction of frames within the cutoff. `0` is clean.
 
-The plot is a diagnostic time series: column-2 distance vs frame, with the
-cutoff drawn in — useful for seeing *when* (if ever) an image approach happens.
+Reported **for information only** (columns 3–6): `max_internal_nm` (the group's
+largest internal span), `min_box_nm` (tightest box edge), and `min_clearance_nm`
+(`box edge − internal span`, worst case). This is the box-sizing view; it can go
+negative for a floppy, extended chain whose span exceeds a box edge without the
+protein ever nearing its image — which is exactly why column 2, not this, is the
+verdict.
 
-### Why not the max-internal-distance / box check
+With `--plot` you also get a diagnostic time series: column-2 distance vs frame,
+with the cutoff drawn in — useful for seeing *when* (if ever) an approach happens.
 
-`gmx mindist -pi` also reports the maximum internal distance and the box
-vectors, and a common box-sizing heuristic compares them (a violation when
-`box − max_internal < 2·cutoff`). That is a worst-case *a priori* proxy: it
-assumes the molecule is a rigid rod aligned with the box vector. For proteins
-with large, floppy side chains, `max_internal` is inflated by internal span that
-says nothing about image proximity, so the proxy raises false alarms. Column 2
-is the direct measurement and is used exclusively here.
+## A caveat on the group
+
+This is a geometric check on whichever group you select. For a group with no
+meaningful internal span — a lone ion or a tiny ligand — gmx returns the box
+vector rather than a real image distance, so the numbers are meaningless. Point
+`--group` at the protein (or another extended group).
 
 ## Tests
 
@@ -95,7 +94,7 @@ pip install pytest
 pytest
 ```
 
-The tests build synthetic `mindist_pi.xvg` files and check the parsing and the
+The tests build synthetic `mindist_pi.xvg` files and check the parsing and
 reported statistics; they do not require GROMACS.
 
 ## License

@@ -1,0 +1,6 @@
+# One run directory per line. An optional second word is a group label used to
+# pool related runs (e.g. replicas) in the output; if omitted, the directory
+# name is used. Blank lines and #-comments are ignored.
+/path/to/run_a          system1
+/path/to/run_b/rep1     system2
+/path/to/run_b/rep2     system2
