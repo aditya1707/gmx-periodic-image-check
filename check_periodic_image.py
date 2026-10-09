@@ -12,6 +12,11 @@ inflated by internal span rather than real image proximity.
 With ``--run`` it first generates the mindist output by calling gmx; without it,
 it summarises existing output files.
 
+Use ``-b``/``-e`` (ps) to analyse a time window; if output already exists, ``-b``
+appends only the new frames to it. Use ``--resume`` to continue a mindist run
+that was interrupted: the partial last row is dropped and gmx restarts from the
+last good time, appending the rest.
+
 Runs file format -- one line per run::
 
     /path/to/run          optional_group_label
@@ -26,6 +31,9 @@ vector rather than a real image distance -- point ``--group`` at the protein.
 Usage:
     # generate data (needs gmx), then summarise:
     python check_periodic_image.py runs.txt --run --group Protein --cutoff 0.3
+    # extend existing output from 50000 ps, or finish an interrupted run:
+    python check_periodic_image.py runs.txt --run -b 50000
+    python check_periodic_image.py runs.txt --run --resume
     # summarise existing mindist output, with the diagnostic plot:
     python check_periodic_image.py runs.txt --cutoff 0.3 --plot
 """
@@ -56,8 +64,52 @@ def read_runs(path):
     return runs
 
 
+def append_new_rows(out, part):
+    """Append data rows from ``part`` to ``out`` that are later than out's last time."""
+    last = load_xvg(out)[-1, 0]
+    new = [ln for ln in part.read_text().splitlines()
+           if ln.strip() and ln[0] not in "@#&" and float(ln.split()[0]) > last]
+    with open(out, "a") as fh:
+        fh.write("\n".join(new) + "\n" if new else "")
+    return len(new)
+
+
+def repair_xvg(path):
+    """Drop a trailing partial row left by an interrupted gmx run.
+
+    A row is partial if the file lacks a final newline or the row has fewer
+    columns than the one before it. Rewrites atomically (temp file + rename).
+    Returns (n_dropped, last_time); last_time is None if no data rows remain.
+    """
+    lines = path.read_text().split("\n")
+    complete = lines.pop() == ""        # text after the last newline, if any
+    dropped = 0 if complete else 1
+    is_data = lambda ln: ln.strip() and ln[0] not in "@#&"
+    data_idx = [i for i, ln in enumerate(lines) if is_data(ln)]
+    if len(data_idx) >= 2 and (len(lines[data_idx[-1]].split())
+                               < len(lines[data_idx[-2]].split())):
+        lines.pop(data_idx[-1])
+        data_idx.pop()
+        dropped += 1
+    if dropped:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text("\n".join(lines) + "\n")
+        tmp.replace(path)
+    last = float(lines[data_idx[-1]].split()[0]) if data_idx else None
+    return dropped, last
+
+
 def generate(runs, args):
-    """Run gmx mindist -pi per run, skipping existing non-empty outputs."""
+    """Run gmx mindist -pi per run.
+
+    Existing non-empty outputs are skipped, unless ``-b`` is given: then gmx
+    runs from that time into a temporary file and only the new frames are
+    appended to the existing output. ``--force`` overwrites instead.
+
+    With ``--resume``, an interrupted output is repaired (partial last row
+    dropped) and gmx is rerun from its last good time, appending any new
+    frames (none, if the output was already complete).
+    """
     if shutil.which("gmx") is None:
         sys.exit("ERROR: 'gmx' not found on PATH. Load your GROMACS module first.")
 
@@ -66,30 +118,53 @@ def generate(runs, args):
         for directory, label in runs:
             d = Path(directory)
             out = d / args.outname
-            if out.exists() and out.stat().st_size > 0 and not args.force:
-                print(f"SKIP    {d} (output exists; --force to redo)")
-                n_skip += 1
-                continue
+            has_out = out.exists() and out.stat().st_size > 0
             xtc, tpr = d / args.xtc, d / args.tpr
             if not d.is_dir() or not xtc.is_file() or not tpr.is_file():
                 print(f"MISSING {d} (need {args.xtc} and {args.tpr})")
                 n_missing += 1
                 continue
+            if args.ndx and not (d / args.ndx).is_file():
+                print(f"MISSING {d} (ndx '{args.ndx}' absent)")
+                n_missing += 1
+                continue
+            part = out.with_name(out.name + ".part")
+            begin = args.begin
+            if args.resume and has_out:
+                part.unlink(missing_ok=True)        # stale from an earlier crash
+                dropped, t_last = repair_xvg(out)
+                if dropped:
+                    print(f"REPAIR  {d} (dropped {dropped} partial line(s))")
+                if t_last is None:
+                    has_out = False                 # nothing usable: full run
+                else:
+                    begin = t_last
+                    print(f"RESUME  {d} (from {t_last:g} ps)")
+            extend = has_out and begin is not None and not args.force
+            if has_out and not extend and not args.force:
+                print(f"SKIP    {d} (output exists; -b to extend, --force to redo)")
+                n_skip += 1
+                continue
+            target = part if extend else out
             cmd = ["gmx", "mindist", "-f", str(xtc), "-s", str(tpr),
-                   "-pi", "-od", str(out)]
+                   "-pi", "-od", str(target)]
+            if begin is not None:
+                cmd += ["-b", f"{begin:g}"]
+            if args.end is not None:
+                cmd += ["-e", f"{args.end:g}"]
             if args.ndx:
-                ndx = d / args.ndx
-                if not ndx.is_file():
-                    print(f"MISSING {d} (ndx '{args.ndx}' absent)")
-                    n_missing += 1
-                    continue
-                cmd += ["-n", str(ndx)]
+                cmd += ["-n", str(d / args.ndx)]
             print(f"RUN     {d}  [group: {label or d.name}]")
             log.write(f"\n==== {d} ====\n")
             log.flush()
             r = subprocess.run(cmd, input=args.group + "\n", text=True,
                                stdout=log, stderr=subprocess.STDOUT)
             if r.returncode == 0:
+                if extend:
+                    n_new = append_new_rows(out, part)
+                    part.unlink()
+                    print(f"        appended {n_new} new frame(s) to {out.name}"
+                          if n_new else f"        already complete ({out.name} unchanged)")
                 n_run += 1
             else:
                 print(f"FAIL    {d} (see mindist_pi.log)")
@@ -207,6 +282,17 @@ def main():
                    help="generate mindist output with gmx before summarising")
     p.add_argument("--force", action="store_true",
                    help="with --run, regenerate even where output exists")
+    p.add_argument("-b", "--begin", type=float, default=None,
+                   help="with --run, start time in ps (gmx mindist -b). If output "
+                        "exists, new frames are appended to it (--force "
+                        "overwrites instead)")
+    p.add_argument("-e", "--end", type=float, default=None,
+                   help="with --run, last frame time to analyse, in ps "
+                        "(gmx mindist -e)")
+    p.add_argument("--resume", action="store_true",
+                   help="with --run, continue interrupted outputs: drop a partial "
+                        "last row, restart from the last good time, append the "
+                        "rest (nothing is added if it was already complete)")
     p.add_argument("--group", default="Protein", help="gmx group to check")
     p.add_argument("--cutoff", type=float, default=1.0,
                    help="interaction cutoff in nm (default 1.0)")
@@ -226,6 +312,12 @@ def main():
     if args.run and not args.tpr.endswith(".tpr"):
         sys.exit(f"ERROR: --tpr '{args.tpr}' is not a .tpr run input file; "
                  f"gmx mindist -pi needs a .tpr.")
+
+    if args.resume and (args.force or args.begin is not None):
+        sys.exit("ERROR: --resume picks its own start time; "
+                 "don't combine it with --force or -b.")
+    if args.resume and not args.run:
+        sys.exit("ERROR: --resume needs --run.")
 
     runs = read_runs(args.runs_file)
     if not runs:

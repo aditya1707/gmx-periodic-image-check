@@ -51,6 +51,32 @@ pip install -r requirements.txt
 
    Existing, non-empty outputs are skipped; add `--force` to regenerate.
 
+   To analyse from a given time and **extend** an existing output instead of
+   replacing it, pass `-b` (ps). gmx runs from that time into a temporary file
+   and only frames later than the existing file's last time are appended, so
+   overlap never duplicates frames (a `-b` later than the end leaves a gap):
+
+   ```bash
+   python check_periodic_image.py runs.txt --run -b 50000 --group Protein
+   ```
+
+   `-e` (ps) sets an end time. Both are passed to `gmx mindist`.
+
+   **Resuming interrupted mindist runs.** If a `gmx mindist` job was killed
+   (cluster issue, cancelled), use `--resume`:
+
+   ```bash
+   python check_periodic_image.py runs.txt --run --resume --group Protein
+   ```
+
+   For each run with an existing output it drops a partial last row (no final
+   newline, or fewer columns than the row before), reruns gmx from the last good
+   time, and appends the remaining frames. A run that was already complete just
+   gets a quick gmx call that adds nothing. Safe to use over a whole runs file.
+   It picks its own start time, so it can't be combined with `-b` or `--force`,
+   and it requires `--run`. This is about interrupted *mindist* output, not
+   unfinished simulations.
+
 3. Re-summarise already-generated output (fast, no GROMACS), with the plot:
 
    ```bash
@@ -58,7 +84,7 @@ pip install -r requirements.txt
    ```
 
 Common flags: `--group` (default `Protein`), `--cutoff` nm (default `1.0`),
-`--xtc`/`--tpr`/`--ndx`/`--outname` file names, `--csv`, `--plot`,
+`-b`/`--begin` and `-e`/`--end` ps, `--resume`, `--force`, `--xtc`/`--tpr`/`--ndx`/`--outname` file names, `--csv`, `--plot`,
 `--plot-file`. The CSV and plot are written to the directory you run from.
 
 ## Interpreting the result
