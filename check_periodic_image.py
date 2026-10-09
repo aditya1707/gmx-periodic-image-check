@@ -157,17 +157,27 @@ def generate(runs, args):
             print(f"RUN     {d}  [group: {label or d.name}]")
             log.write(f"\n==== {d} ====\n")
             log.flush()
+            log.write("$ " + " ".join(cmd) + "\n")
             r = subprocess.run(cmd, input=args.group + "\n", text=True,
-                               stdout=log, stderr=subprocess.STDOUT)
+                               capture_output=True)
+            log.write(r.stdout + r.stderr + f"\n[exit code {r.returncode}]\n")
+            log.flush()
             if r.returncode == 0:
                 if extend:
                     n_new = append_new_rows(out, part)
                     part.unlink()
-                    print(f"        appended {n_new} new frame(s) to {out.name}"
-                          if n_new else f"        already complete ({out.name} unchanged)")
+                    if n_new:
+                        t_now = load_xvg(out)[-1, 0]
+                        print(f"        appended {n_new} new frame(s); "
+                              f"{out.name} now ends at {t_now:g} ps")
+                    else:
+                        print(f"        no new frames ({out.name} unchanged)")
                 n_run += 1
             else:
-                print(f"FAIL    {d} (see mindist_pi.log)")
+                tail = (r.stderr or r.stdout).strip().splitlines()[-5:]
+                print(f"FAIL    {d} (exit code {r.returncode}; see mindist_pi.log)")
+                for ln in tail:
+                    print(f"          {ln}")
                 n_fail += 1
     print(f"\nGenerated: ran={n_run} skipped={n_skip} "
           f"missing={n_missing} failed={n_fail}")
