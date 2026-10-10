@@ -40,6 +40,7 @@ Usage:
 
 import argparse
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -99,6 +100,12 @@ def repair_xvg(path):
     return dropped, last
 
 
+def output_path(directory, outname, outdir=None):
+    """Where a run's mindist .xvg lives: its own dir, or <outdir>/<dir name>/."""
+    d = Path(directory)
+    return Path(outdir) / d.name / outname if outdir else d / outname
+
+
 def generate(runs, args):
     """Run gmx mindist -pi per run.
 
@@ -117,8 +124,7 @@ def generate(runs, args):
     with open("mindist_pi.log", "a") as log:
         for directory, label in runs:
             d = Path(directory)
-            out = d / args.outname
-            has_out = out.exists() and out.stat().st_size > 0
+            out = output_path(d, args.outname, args.outdir)
             xtc, tpr = d / args.xtc, d / args.tpr
             if not d.is_dir() or not xtc.is_file() or not tpr.is_file():
                 print(f"MISSING {d} (need {args.xtc} and {args.tpr})")
@@ -128,6 +134,17 @@ def generate(runs, args):
                 print(f"MISSING {d} (ndx '{args.ndx}' absent)")
                 n_missing += 1
                 continue
+            if args.outdir:
+                out.parent.mkdir(parents=True, exist_ok=True)
+                src = d / args.outname
+                # Continue from a pre-existing output without touching the
+                # original: seed a copy in outdir, then work on the copy.
+                if ((args.resume or args.begin is not None) and not args.force
+                        and not (out.exists() and out.stat().st_size > 0)
+                        and src.exists() and src.stat().st_size > 0):
+                    shutil.copy2(src, out)
+                    print(f"SEED    {d} (copied existing {src.name} to {out.parent})")
+            has_out = out.exists() and out.stat().st_size > 0
             part = out.with_name(out.name + ".part")
             begin = args.begin
             if args.resume and has_out:
@@ -175,7 +192,13 @@ def generate(runs, args):
                 n_run += 1
             else:
                 tail = (r.stderr or r.stdout).strip().splitlines()[-5:]
-                print(f"FAIL    {d} (exit code {r.returncode}; see mindist_pi.log)")
+                why = f"exit code {r.returncode}"
+                if r.returncode < 0:
+                    try:
+                        why += f" = killed by {signal.Signals(-r.returncode).name}"
+                    except ValueError:
+                        pass
+                print(f"FAIL    {d} ({why}; see mindist_pi.log)")
                 for ln in tail:
                     print(f"          {ln}")
                 n_fail += 1
@@ -188,11 +211,11 @@ def load_xvg(path):
     return np.atleast_2d(np.loadtxt(path, comments=["@", "#", "&"]))
 
 
-def analyse(runs, cutoff, outname):
+def analyse(runs, cutoff, outname, outdir=None):
     """Compute per-run statistics. Returns (rows, plot_series)."""
     rows, series = [], []
     for directory, label in runs:
-        path = Path(directory) / outname
+        path = output_path(directory, outname, outdir)
         if not path.exists():
             print(f"  missing: {path}")
             continue
@@ -311,6 +334,11 @@ def main():
     p.add_argument("--ndx", default="", help="index file name (optional)")
     p.add_argument("--outname", default="mindist_pi.xvg",
                    help="mindist output file name, written in each run dir")
+    p.add_argument("--outdir", default=None,
+                   help="write each run's mindist output to <outdir>/<run dir "
+                        "name>/ instead of the run directory (which is then "
+                        "never modified); existing output is copied there "
+                        "first when resuming or using -b")
     p.add_argument("--csv", default="periodic_image_summary.csv",
                    help="output CSV path")
     p.add_argument("--plot", action="store_true",
@@ -332,11 +360,16 @@ def main():
     runs = read_runs(args.runs_file)
     if not runs:
         sys.exit(f"No runs found in {args.runs_file}.")
+    if args.outdir:
+        names = [Path(dr).name for dr, _ in runs]
+        if len(set(names)) != len(names):
+            sys.exit("ERROR: --outdir needs unique run directory names "
+                     "(they name the output subdirectories).")
 
     if args.run:
         generate(runs, args)
 
-    rows, series = analyse(runs, args.cutoff, args.outname)
+    rows, series = analyse(runs, args.cutoff, args.outname, args.outdir)
     if not rows:
         print("\nNo readable output files. Use --run to generate them first.")
         return

@@ -83,8 +83,14 @@ pip install -r requirements.txt
    python check_periodic_image.py runs.txt --cutoff 1.0 --plot
    ```
 
+**Keeping outputs elsewhere.** `--outdir DIR` writes each run's output to
+`DIR/<run directory name>/` instead of the run directory, which is then only
+read, never modified. With `--resume` or `-b`, a pre-existing output in the run
+directory is first copied into `DIR` and the copy is repaired and extended.
+Run directory names must be unique. Summaries read from `--outdir` too.
+
 Common flags: `--group` (default `Protein`), `--cutoff` nm (default `1.0`),
-`-b`/`--begin` and `-e`/`--end` ps, `--resume`, `--force`, `--xtc`/`--tpr`/`--ndx`/`--outname` file names, `--csv`, `--plot`,
+`-b`/`--begin` and `-e`/`--end` ps, `--resume`, `--outdir`, `--force`, `--xtc`/`--tpr`/`--ndx`/`--outname` file names, `--csv`, `--plot`,
 `--plot-file`. The CSV and plot are written to the directory you run from.
 
 ## Interpreting the result
